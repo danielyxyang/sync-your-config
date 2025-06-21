@@ -1,0 +1,198 @@
+#!zsh
+
+# set help message
+usage=$(cat << EOF
+Usage: $(basename $0) [options] -- <command>
+
+Submit a job to the underlying scheduler.
+
+Output folder:
+  By default, log files are placed into "./output" relative to the current
+  working directory. A versioned output folder is created under one of the
+  following conditions:
+  - A version for the output folder is provided. If this version contains the
+    placeholder "%time", it will be replaced with the current date and time of
+    submission. If this version contains the placeholder "%tag", it will be
+    replaced with a random name and number.
+  - The placeholder "%out" is used in "<path to>" for creating a snapshot.
+  - The placeholder "%out" is used in "<command>".
+  The job is named according to the version of the output folder if a job name
+  is not provided.
+
+Options:
+  -h, --help
+  -i, --interactive
+  -n, --no-job
+  -q, --queue   <queue>
+  -t, --time    <time requirements>
+  -c, --cores   <core requirements>
+  -m, --mem     <memory requirements>
+  -g, --gpu     <gpu requirements>
+  -o, --out     <path to output folder>
+  -v, --version <version of output folder>
+  -s, --snap    <path from> <path to>
+
+Other options are forwarded to the underlying scheduler.
+
+EOF
+)
+# parse submission command
+is_interactive=0
+no_job=0
+job_name=""
+queue=""
+time=""
+cores=""
+mem=""
+gpu=""
+out="output"
+out_version=""
+has_snap=0
+snap_from=""
+snap_to=""
+is_array_job=0
+args_submit=()
+(( $# == 0 )) && { echo "${usage}"; exit 0; }
+while (( $# > 0 )); do
+  case "$1" in
+    -i|--interactive) is_interactive=1; shift 1;;
+    -n|--no-job)      no_job=1; shift 1;;
+    -J|--job-name)    job_name="$2"; shift 2;;
+    -q|--queue)       queue="$2"; shift 2;;
+    -t|--time)        time="$2"; shift 2;;
+    -c|--cores)       cores="$2"; shift 2;;
+    -m|--mem)         mem="$2"; shift 2;;
+    -g|--gpu)         gpu="$2"; shift 2;;
+    -o|--out)         out="$2"; shift 2;;
+    -v|--version)     out_version="$2"; shift 2;;
+    -s|--snap)        has_snap=1; snap_from="$2"; snap_to="$3"; shift 3;;
+    -h|--help)        echo "${usage}"; exit 0;;
+    --)               shift 1; break;; # stop parsing job commands
+    *)
+      # check for options
+      case "$1" in
+        -a|--array)    is_array_job=1;;
+        --mem-per-cpu) mem="";;
+        --mem-per-gpu) mem="";;
+      esac
+      args_submit+=("$1"); shift 1;;
+  esac
+done
+# parse job command
+args_job=()
+while (( $# > 0 )); do
+  args_job+=("$1")
+  shift 1
+done
+
+# check for placeholder %out
+is_out_used=0
+if [[ "${snap_to}" =~ "%out" ]]; then
+  is_out_used=1
+fi
+for ((i=1; i<=${#args_job[@]}; i++)); do # BASH 0-index
+  if [[ "${args_job[$i]}" =~ "%out" ]]; then
+    is_out_used=1
+  fi
+done
+
+if (( is_out_used || ! is_interactive )); then
+  # set output path with unique version
+  timestamp="$(date "+%Y%m%d-%H%M%S")"
+  random_tag="$(random_string)"
+  [[ "${out}" != /* ]] && out="$(pwd)/${out}" # resolve relative output paths
+  if [[ -n "${out_version}" ]]; then
+    out_version="${out_version//\%time/${timestamp}}"
+    out_version="${out_version//\%tag/${random_tag}}"
+    out_folder="${out}/${out_version}"
+  elif (( is_out_used )) then
+    out_version="${timestamp}-${random_tag}"
+    out_folder="${out}/${out_version}"
+  elif (( ! is_interactive )) then
+    out_folder="${out}"
+  fi
+  # set path to log file
+  if (( ! is_interactive )) then
+    (( is_array_job )) && job_id="%A_%a" || job_id="%j"
+    out_log_file="${out_folder}/job-${timestamp}-${job_id}.log"
+  fi
+  # set job name with output version if empty
+  if [[ -z "${job_name}" && -n "${out_version}" ]] then
+    job_name="${out_version}"
+  fi
+fi
+
+# define submission command
+command_submit=()
+if (( is_interactive )); then
+  command_submit+=( "srun" "--pty" )
+else
+  command_submit+=( "sbatch" )
+  command_submit+=( "--output" "${out_log_file}" )
+fi
+[[ -n "${job_name}" ]] && command_submit+=( "--job-name" "${job_name}" )
+[[ -n "${queue}" ]] && command_submit+=( "--partition" "${queue}" )
+[[ -n "${time}" ]]  && command_submit+=( "--time" "${time}" )
+[[ -n "${cores}" ]] && command_submit+=( "--cpus-per-task" "${cores}" )
+[[ -n "${mem}" ]]   && command_submit+=( "--mem" "${mem}" )
+[[ -n "${gpu}" ]]   && command_submit+=( "--gpus" "${gpu}" )
+command_submit+=( "${args_submit[@]}" )
+# define job command
+command_job=( "${args_job[@]}" )
+
+# replace placeholder %out
+snap_to="${snap_to/\%out/${out_folder}}"
+for ((i=1; i<=${#command_job[@]}; i++)); do # BASH 0-index
+  command_job[$i]="${command_job[$i]/\%out/${out_folder}}"
+done
+
+# print job information
+newline=$'\n'
+
+if (( no_job )); then
+  cat << EOF
+
+Job name:         ${job_name}
+Output version:   ${out_version}
+Output folder:    ${out_folder}
+
+SLURM_JOB_NAME="${job_name}"
+
+${command_job[*]// /${newline}}
+
+EOF
+else
+  cat << EOF
+
+Job name:         ${job_name}
+Output version:   ${out_version}
+Output folder:    ${out_folder}
+Log file:         ${out_log_file}
+
+${command_submit[*]// -/${newline}-}
+
+${command_job[*]// /${newline}}
+
+EOF
+fi
+
+# submit job
+read -r -k 1 "REPLY?Continue submitting job? [y/n] " # BASH use -n 1 -p "PROMPT"
+[[ "${REPLY}" != $'\n' ]] && echo >&1
+[[ "${REPLY}" == 'y' ]] && {
+  # create output directory
+  if (( is_out_used || ! is_interactive )); then
+    mkdir -p "${out_folder}"
+  fi
+  # create read-only snapshot
+  if (( has_snap )); then
+    cp -r "${snap_from}" "${snap_to}"
+    chmod -R ugo-w "${snap_to}"
+  fi
+  # submit job
+  if (( no_job )); then
+    SLURM_JOB_NAME="${job_name}"  "${command_job[@]}"
+  else
+    "${command_submit[@]}" "${command_job[@]}"
+  fi
+}
